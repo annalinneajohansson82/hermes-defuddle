@@ -146,10 +146,15 @@ class TestExtractSuccess(unittest.IsolatedAsyncioTestCase):
         assert r["content"] == "Body text."
 
     async def test_extract_fallback_to_content_key(self):
-        """When contentMarkdown is missing, falls back to 'content' key."""
+        """When contentMarkdown is missing, returns an error (no HTML in content).
+
+        Per S2: `content` must hold markdown or be empty — never raw HTML.
+        The HTML is preserved in `raw_content` and an error is returned so the
+        caller knows defuddle didn't produce clean markdown.
+        """
         provider = DefuddleWebExtractProvider()
         defuddle_json = json.dumps({
-            "content": "Fallback content text.",
+            "content": "<p>Fallback HTML content.</p>",
             "title": "Fallback Title",
             "wordCount": 3,
         }).encode()
@@ -161,7 +166,14 @@ class TestExtractSuccess(unittest.IsolatedAsyncioTestCase):
             results = await provider.extract(["https://example.com/a"])
 
         r = results[0]
-        assert r["content"] == "Fallback content text."
+        # content is empty, not HTML
+        assert r["content"] == ""
+        # raw_content preserves the HTML
+        assert r["raw_content"] == "<p>Fallback HTML content.</p>"
+        # title is still surfaced
+        assert r["title"] == "Fallback Title"
+        # an error explains the situation
+        assert "markdown" in r["error"]
 
     async def test_extract_multiple_urls_parallel(self):
         """Multiple URLs are extracted and returned in order."""
@@ -226,12 +238,12 @@ class TestExtractErrors(unittest.IsolatedAsyncioTestCase):
         """When the subprocess times out, returns a timeout error."""
         provider = DefuddleWebExtractProvider()
 
-        # Use a plain MagicMock for communicate (not async) — the coroutine
-        # is never awaited because asyncio.wait_for is patched to raise.
-        # This avoids the 'coroutine never awaited' RuntimeWarning.
+        # communicate is a non-async MagicMock: asyncio.wait_for is patched to
+        # raise before the return value is ever awaited, so no coroutine is
+        # created (avoids 'coroutine never awaited' RuntimeWarning).
         proc = MagicMock()
         proc.returncode = None
-        proc.communicate = MagicMock(return_value=b"")  # not a coroutine
+        proc.communicate = MagicMock(return_value=(b"", b""))
 
         with patch("provider.shutil.which", return_value="/usr/bin/defuddle"), \
              patch("provider.asyncio.create_subprocess_exec", return_value=proc), \
@@ -242,6 +254,31 @@ class TestExtractErrors(unittest.IsolatedAsyncioTestCase):
         r = results[0]
         assert "timed out" in r["error"]
         assert r["content"] == ""
+
+    async def test_subprocess_timeout_kills_proc(self):
+        """M1: on timeout the subprocess is killed (no zombie leak)."""
+        provider = DefuddleWebExtractProvider()
+
+        proc = MagicMock()
+        proc.returncode = None
+        proc.kill = MagicMock()
+
+        # wait() is awaited in the kill path — needs to be a real awaitable.
+        async def _wait():
+            return 0
+
+        proc.wait = _wait
+        # communicate is non-async (same reason as test_subprocess_timeout).
+        proc.communicate = MagicMock(return_value=(b"", b""))
+
+        with patch("provider.shutil.which", return_value="/usr/bin/defuddle"), \
+             patch("provider.asyncio.create_subprocess_exec", return_value=proc), \
+             patch("provider.asyncio.wait_for",
+                   side_effect=asyncio.TimeoutError()):
+            results = await provider.extract(["https://example.com/slow"])
+
+        # proc.kill() must have been called to reap the zombie
+        proc.kill.assert_called_once()
 
     async def test_subprocess_exception(self):
         """When create_subprocess_exec raises, returns a generic error."""
@@ -312,6 +349,86 @@ class TestExtractErrors(unittest.IsolatedAsyncioTestCase):
         assert results[0]["title"] == "Good"
         assert "error" not in results[0]
         assert "exited 2" in results[1]["error"]
+
+    async def test_gather_isolates_base_exception(self):
+        """M2: a BaseException in one task doesn't abort sibling extractions.
+
+        return_exceptions=True lets asyncio.gather survive a CancelledError
+        (BaseException) raised by one task while siblings still complete.
+        """
+        provider = DefuddleWebExtractProvider()
+
+        good_json = json.dumps({
+            "contentMarkdown": "Survived content",
+            "title": "Survived",
+            "wordCount": 2,
+        }).encode()
+        proc_good = _make_proc(good_json, b"", 0)
+
+        # Patch _extract_one so the first URL raises a BaseException
+        # (CancelledError is a BaseException in 3.8+) and the second goes
+        # through the normal path. Using the real provider method for the
+        # second URL exercises the gather isolation end-to-end.
+        original_extract_one = provider._extract_one
+
+        async def _raising_extract(url: str):
+            if url == "https://example.com/boom":
+                raise asyncio.CancelledError("simulated cancel")
+            return await original_extract_one(url)
+
+        with patch("provider.shutil.which", return_value="/usr/bin/defuddle"), \
+             patch("provider.asyncio.create_subprocess_exec", return_value=proc_good), \
+             patch.object(provider, "_extract_one", side_effect=_raising_extract):
+            results = await provider.extract([
+                "https://example.com/boom",
+                "https://example.com/ok",
+            ])
+
+        assert len(results) == 2
+        # The failed task is converted to an error dict (not re-raised)
+        assert "error" in results[0]
+        assert "extraction failed" in results[0]["error"]
+        # The sibling succeeded despite the first task's BaseException
+        assert results[1]["title"] == "Survived"
+        assert "Survived content" in results[1]["content"]
+
+    async def test_empty_stdout_guard(self):
+        """S1: empty stdout with exit code 0 gives a clear 'empty output' error,
+        not a confusing JSONDecodeError.
+        """
+        provider = DefuddleWebExtractProvider()
+        proc = _make_proc(b"", b"", 0)
+
+        with patch("provider.shutil.which", return_value="/usr/bin/defuddle"), \
+             patch("provider.asyncio.create_subprocess_exec", return_value=proc):
+            results = await provider.extract(["https://example.com/blank"])
+
+        r = results[0]
+        assert "empty output" in r["error"]
+        assert r["content"] == ""
+
+    async def test_multiline_description_blockquote(self):
+        """S3: multi-line descriptions get '> ' prefix on every line."""
+        provider = DefuddleWebExtractProvider()
+        defuddle_json = json.dumps({
+            "contentMarkdown": "Body text.",
+            "title": "Title",
+            "description": "Line one\nLine two\nLine three",
+            "wordCount": 2,
+        }).encode()
+
+        proc = _make_proc(defuddle_json, b"", 0)
+
+        with patch("provider.shutil.which", return_value="/usr/bin/defuddle"), \
+             patch("provider.asyncio.create_subprocess_exec", return_value=proc):
+            results = await provider.extract(["https://example.com/multi"])
+
+        r = results[0]
+        content = r["content"]
+        # Every line of the description should be a blockquote line
+        assert content.startswith("> Line one\n> Line two\n> Line three")
+        # Body follows after the blank separator
+        assert "\n\nBody text." in content
 
 
 class TestRegister(unittest.TestCase):

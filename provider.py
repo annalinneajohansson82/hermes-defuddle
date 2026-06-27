@@ -67,8 +67,23 @@ class DefuddleWebExtractProvider(WebSearchProvider):
         Runs defuddle once per URL in parallel via asyncio.
         """
         tasks = [self._extract_one(url) for url in urls]
-        results = await asyncio.gather(*tasks)
-        return list(results)
+        # return_exceptions=True so a BaseException (e.g. CancelledError) in one
+        # task doesn't abort sibling extractions. Convert any exception results
+        # to error dicts, preserving URL-to-result ordering via the task list.
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        results: List[Dict[str, Any]] = []
+        for url, res in zip(urls, gathered):
+            if isinstance(res, BaseException):
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": f"extraction failed: {res}",
+                })
+            else:
+                results.append(res)
+        return results
 
     async def _extract_one(self, url: str) -> Dict[str, Any]:
         """Extract a single URL via defuddle."""
@@ -87,10 +102,28 @@ class DefuddleWebExtractProvider(WebSearchProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except Exception as exc:
+            logger.warning("defuddle subprocess error for %s: %s", url, exc)
+            return {
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": f"defuddle failed: {exc}",
+            }
+
+        try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=_DEFUDDLE_TIMEOUT
             )
         except asyncio.TimeoutError:
+            # asyncio.wait_for cancels communicate() but does NOT terminate the
+            # underlying subprocess — kill it to avoid leaking a zombie process.
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
             return {
                 "url": url,
                 "title": "",
@@ -99,7 +132,7 @@ class DefuddleWebExtractProvider(WebSearchProvider):
                 "error": f"defuddle timed out after {_DEFUDDLE_TIMEOUT}s",
             }
         except Exception as exc:
-            logger.warning("defuddle subprocess error for %s: %s", url, exc)
+            logger.warning("defuddle communicate error for %s: %s", url, exc)
             return {
                 "url": url,
                 "title": "",
@@ -119,6 +152,17 @@ class DefuddleWebExtractProvider(WebSearchProvider):
                 "error": f"defuddle exited {proc.returncode}: {err_msg}",
             }
 
+        # Guard against empty output before json.loads (avoids confusing
+        # JSONDecodeError when defuddle returns nothing with exit code 0).
+        if not stdout.strip():
+            return {
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": "defuddle returned empty output",
+            }
+
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError as exc:
@@ -131,7 +175,19 @@ class DefuddleWebExtractProvider(WebSearchProvider):
                 "error": f"defuddle returned invalid JSON: {exc}",
             }
 
-        content_md = data.get("contentMarkdown", "") or data.get("content", "")
+        # contentMarkdown is the clean markdown we want in `content`. If it's
+        # missing, don't put HTML into `content` (downstream LLMs expect
+        # markdown, not raw HTML) — return an error so the caller knows.
+        content_md = data.get("contentMarkdown", "")
+        if not content_md:
+            logger.warning("defuddle returned no contentMarkdown for %s", url)
+            return {
+                "url": url,
+                "title": data.get("title", "") or "",
+                "content": "",
+                "raw_content": data.get("content", ""),
+                "error": "defuddle did not produce markdown content",
+            }
         title = data.get("title", "") or ""
         description = data.get("description", "") or ""
 
@@ -154,9 +210,12 @@ class DefuddleWebExtractProvider(WebSearchProvider):
             "metadata": metadata,
         }
 
-        # Include description as a prefix if it's different from title
+        # Include description as a prefix if it's different from title.
+        # Prefix every line with "> " so multi-line descriptions stay valid
+        # blockquotes (a single "> " only quotes the first line).
         if description and description != title:
-            result["content"] = f"> {description}\n\n{content_md}"
+            quoted_desc = description.replace("\n", "\n> ")
+            result["content"] = f"> {quoted_desc}\n\n{content_md}"
 
         logger.info(
             "defuddle extract %s: %d chars markdown, %d words",
