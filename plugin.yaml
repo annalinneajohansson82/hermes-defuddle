@@ -1,0 +1,7 @@
+name: web-defuddle
+version: 1.0.0
+description: "Defuddle content extraction — local, free, no API key. Shells out to the defuddle CLI for clean article markdown. Extract-only; pair with SearXNG or another search provider."
+author: anna
+kind: backend
+provides_web_providers:
+  - defuddle
