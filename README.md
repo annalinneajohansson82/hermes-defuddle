@@ -6,10 +6,10 @@ to fetch article content from URLs. Clean markdown, rich metadata, no API key.
 
 ## Features
 
-- **Free & local** — no API key, no external service, no credits
+- **Free & local** 
 - **Clean markdown** — strips nav, sidebars, ads, and other boilerplate
 - **Rich metadata** — title, description, domain, language, word count, author, publish date
-- **No truncation** — returns full page content (unlike cloud providers that cap at ~5K chars). Note: the Hermes dispatcher's LLM-processing stage may still summarize or compress long content when an auxiliary model is available; this is a dispatcher-level concern, not a provider limitation.
+- **No truncation** — returns full page content. Note: the Hermes dispatcher's LLM-processing stage may still summarize or compress long content when an auxiliary model is available; this is a dispatcher-level concern, not a provider limitation.
 - **Parallel extraction** — multiple URLs fetched concurrently via asyncio
 
 ## Requirements
