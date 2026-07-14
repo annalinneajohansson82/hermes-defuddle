@@ -97,8 +97,15 @@ class DefuddleWebExtractProvider(WebSearchProvider):
             }
 
         try:
+            # stdin MUST be DEVNULL, not the default (inherit). Under
+            # ``hermes --tui`` this provider runs inside the TUI gateway, whose
+            # fd 0 is the JSON-RPC command pipe from the Node TUI. An inherited
+            # fd 0 lets the defuddle CLI read bytes destined for the gateway's
+            # dispatch loop, and keeps a second reader on that pipe alive for
+            # the life of the subprocess.
             proc = await asyncio.create_subprocess_exec(
                 "defuddle", "parse", "--json", url,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -201,12 +208,15 @@ class DefuddleWebExtractProvider(WebSearchProvider):
             "published": data.get("published", ""),
         }
 
-        # content field gets the markdown; raw_content gets the HTML if available
+        # content field gets the markdown. The web_extract_tool truncation
+        # layer (web_tools.py line 989) prefers raw_content over content, so
+        # we deliberately omit raw_content — our "content" is already the
+        # clean markdown form. Passing raw HTML would make the tool show
+        # HTML instead of markdown to the user (and to downstream LLMs).
         result: Dict[str, Any] = {
             "url": url,
             "title": title,
             "content": content_md,
-            "raw_content": data.get("content", ""),  # HTML content
             "metadata": metadata,
         }
 

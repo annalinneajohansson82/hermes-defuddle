@@ -97,7 +97,7 @@ class TestExtractSuccess(unittest.IsolatedAsyncioTestCase):
         assert r["title"] == "Hello World"
         assert "# Hello World" in r["content"]
         assert "This is article text." in r["content"]
-        assert r["raw_content"] == "<p>Hello World</p>"
+        assert "raw_content" not in r  # deliberately omitted — see provider.py
         assert r["metadata"]["domain"] == "example.com"
         assert r["metadata"]["language"] == "en"
         assert r["metadata"]["word_count"] == 5
