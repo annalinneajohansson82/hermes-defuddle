@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import sys
 import shutil
 from typing import Any, Dict, List
 
@@ -38,6 +40,47 @@ logger = logging.getLogger(__name__)
 
 # Timeout for the defuddle CLI subprocess (seconds)
 _DEFUDDLE_TIMEOUT = 60
+
+
+def _defuddle_argv(url: str) -> List[str]:
+    """Return an executable argv for ``defuddle parse --json <url>``.
+
+    Preference order:
+
+    1. ``node`` + the installed package's real CLI entry (``package.json``
+       ``bin``). This is the only form that works on Windows: ``.CMD`` shims
+       cannot be spawned directly, and spawning them through ``cmd.exe`` is
+       refused in the execute_code sandbox, while ``node`` execs fine.
+    2. The PATH-resolved ``defuddle`` binary (POSIX, and Windows ``.exe``
+       installs).
+    3. Bare ``defuddle`` as a last resort.
+    """
+    shim = shutil.which("defuddle")
+    if shim:
+        prefix = os.path.dirname(shim)
+        candidates = (
+            os.path.join(prefix, "node_modules", "defuddle"),                 # npm global
+            os.path.join(prefix, "..", "lib", "node_modules", "defuddle"),    # unix prefix
+        )
+        for pkg_dir in candidates:
+            pkg_json = os.path.join(pkg_dir, "package.json")
+            if not os.path.exists(pkg_json):
+                continue
+            try:
+                with open(pkg_json, encoding="utf-8") as fh:
+                    binfield = json.load(fh).get("bin")
+                if not binfield:
+                    continue
+                rel = binfield if isinstance(binfield, str) else list(binfield.values())[0]
+                cli = os.path.normpath(os.path.join(pkg_dir, rel))
+                if os.path.exists(cli):
+                    return ["node", cli, "parse", "--json", url]
+            except (OSError, ValueError, IndexError):
+                continue
+        if not (sys.platform == "win32" and shim.lower().endswith((".cmd", ".bat"))):
+            return [shim, "parse", "--json", url]
+    return ["defuddle", "parse", "--json", url]
+
 
 
 class DefuddleWebExtractProvider(WebSearchProvider):
@@ -103,8 +146,9 @@ class DefuddleWebExtractProvider(WebSearchProvider):
             # fd 0 lets the defuddle CLI read bytes destined for the gateway's
             # dispatch loop, and keeps a second reader on that pipe alive for
             # the life of the subprocess.
+            argv = _defuddle_argv(url)
             proc = await asyncio.create_subprocess_exec(
-                "defuddle", "parse", "--json", url,
+                *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
